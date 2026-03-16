@@ -1,0 +1,725 @@
+---
+title: "STA 141A:  Predicting Wildfire Incidence in the United States" 
+author:  Dinglei Yao 
+output: html_document 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) 
+```
+
+```{r} 
+# install.packages("slider") 
+# install.packages("gbm") 
+
+suppressMessages({ 
+    library(tidyverse) 
+    library(slider) 
+    library(pROC) 
+    library(nnet) 
+    library(randomForest) 
+    library(gbm) 
+    library(lubridate) 
+}) 
+
+set.seed(141) 
+``` 
+
+## Abstract 
+
+In this project, we develop spatial-temporal prediction model to estimate the probability that a notable wildfire (>=300 acres) will occur during the next month. 
+
+The modeling dataset is constructed by aggregating wildfire incident records into 1°(latitude) × 1°(longitude) grid cells and monthly intervals to produce a panel dataset that captures wildfire trends between 1992 and 2015. Predictors include seasonal variables, historical fire activities, and wildfire severity indicators. 
+
+Three predictive models are evaluated: logistic regression baseline model, neural network model, and gradient boosting model (GBM). Model performance is evaluated by time-aware cross-validation and the Area Under the ROC Curve (AUC) to account for the severe class imbalance in wildfire occurrence. 
+
+**Key Findings** 
+
+- Wildfire exhibits **strong geographic clustering**; **seasonal pattern** 
+- Models that structure on nonlinear interactions (**GBM and Neural Networks**) outperform logistic regression 
+- **Gradient Boosting gives the best predictive performance**, suggesting wildfire risk depends on nonlinear interactions between predictors 
+- wildfire prediction benefits from combining existing spatial and temporal predictors, while remains **limitations of models on evaluating environmental variable**.  
+
+## 1. Data Preprocessing 
+
+This section constructs the modeling dataset from raw wildfire dataset The primary objective is to transform individual fire events into consistent space–time observations suitable for prediction. 
+
+Dataset construction: 
+
+- Define a meaningful notable wildfire threshold 
+- Construct spatial grid units and monthly time intervals 
+- Create a binary prediction target for next-month wildfire occurrence 
+- Define predictors representing seasonality and historical wildfire activity 
+
+### 1.1 Load and prepare the wildfire data 
+We start with a table of wildfire events, keeping the variables needed for time indexing, event size, and spatial assignment. 
+The variable `FIRE_DATE` is reconstructed from the recorded fire year and day-of-year, ensuring that the **temporal unit** of analysis is **monthly**. 
+```{r, message = FALSE} 
+# load wildfire dataset and keep key variables 
+wildfires = read_csv("/Users/ydl/Desktop/UCD/STA 141A/Project/Data/wildfires_sample_100k.csv") %>% 
+  select(FIRE_YEAR, DISCOVERY_DOY, FIRE_SIZE, LATITUDE, LONGITUDE, STATE) %>% 
+  mutate(STATE = as.factor(STATE), FIRE_DATE = as.Date(paste(FIRE_YEAR, DISCOVERY_DOY, sep = "-"), format = "%Y-%j"),
+          YEAR = year(FIRE_DATE), 
+          MONTH = month(FIRE_DATE)) 
+``` 
+
+### 1.2 Identifying notable wildfires 
+Not every recorded fire is equally relevant for risk prediction, we need to determine what defines a meaningful wildfire event for prediction. In this report, we define **a notable wildfire with fire burning at least 300 acres**. 
+A 300-acre cutoff was used to define notable wildfires so that the analysis focused on larger, influential wildfire events. Very small fires may be caused by household incidents and are usually brought under control quickly, including these small events could obscure the underlying environmental, seasonal patterns that drive wildfire risk. By restricting the analysis to fires larger than 300 acres, the dataset better represents fires that reflect broader wildfire condtions that algined with fire management concerns. 
+```{r} 
+# threshold used to identify notable fires 
+notable_threshold_acres = 300 
+
+# filter fires that size exceeds the threshold 
+notable_fires = wildfires %>% 
+  filter(FIRE_SIZE >= notable_threshold_acres) 
+
+# report the number of notable fires 
+cat("Number of notable fires:", nrow(notable_fires)) 
+``` 
+
+### 1.3 Constructing space-time units 
+The original dataset records individual wildfire events, but prediction requires a **consistent observational unit**. 
+
+**To create this structure, we need:** 
+
+- Geographic coordinates are grouped into 1° × 1° grid cells 
+- Time is aggregated to the monthly level 
+
+Each observation therefore represents wildfire activity for a specific location during a given month. 
+
+Because the dataset at this stage includes only months in which wildfire occurred, the binary indicator **$Y_{g,t}$ equals 1** for all rows. 
+```{r} 
+notable_fires = notable_fires %>% 
+  mutate( 
+    # create spatial unit 
+    lat_bin = floor(LATITUDE), 
+    lon_bin = floor(LONGITUDE), 
+    # create time unit 
+    ym = YEAR * 100 + MONTH 
+  ) 
+
+# grid fires within each space-time unit 
+grid_month_fire = notable_fires %>% 
+  group_by(lat_bin, lon_bin, ym) %>% 
+  summarise(n_fires = n(), .groups = "drop") %>% 
+  mutate(fire_this_month = 1) 
+
+head(grid_month_fire) 
+``` 
+**Using grid cells provides several benefits:** 
+
+- Standardizes spatial units 
+- Allows wildfire patterns to be compared across locations 
+
+### 1.4 Complete grid-by-month panel 
+At this stage, the dataset only includes grid-month combinations where fires occurred. 
+
+However, a complete predictive modeling requires both **months with fires** and **months without fires** to enables the model to distinguish between high-risk and low-risk situations. 
+
+To construct the full dataset, we generate all combinations of spatial locations and months observed within the study period and then combined with wildfire counts. 
+**Missing values are replaced with zero**, indicating months with no notable wildfire occurrence. 
+```{r} 
+# identify all spatial grid cells where fires were observed 
+all_grids = grid_month_fire %>% 
+  distinct(lat_bin, lon_bin) 
+
+# time range of the dataset 
+start_date = ymd(paste0(min(grid_month_fire$ym) %/% 100, "-", min(grid_month_fire$ym) %% 100, "-01")) 
+end_date = ymd(paste0(max(grid_month_fire$ym) %/% 100, "-", max(grid_month_fire$ym) %% 100, "-01")) 
+
+# complete month and date sequence 
+all_months = tibble(date = seq.Date(start_date, end_date, by = "month")) %>% 
+  mutate(year = year(date), month = month(date), ym = year * 100 + month) %>% 
+  select(ym, year, month) 
+
+# the complete grid-by-month panel 
+panel = crossing(all_grids, all_months) %>% 
+  left_join(grid_month_fire, by = c("lat_bin", "lon_bin", "ym")) %>% 
+  # label the missing fire records with 0 
+  mutate(n_fires = replace_na(n_fires, 0), fire_this_month = replace_na(fire_this_month, 0)) 
+
+glimpse(panel) 
+``` 
+
+In addition to the previous table, `fire_this_month` is now a **binary indicator** showing whether at least one notable wildfire occurred (1) or not (0). 
+
+### 1.5 Define the next month binary outcome 
+The goal of this project is to predict whether a notable wildfire will occur in the next month. 
+
+To construct this prediction, the variable `fire_this_month` is **shifted forward by one month within each grid cell**, thus the outcome variable is: 
+$$ 
+Y_{g,t} = 
+\begin{cases} 
+1 & \text{if a notable wildfire occurs in grid cell } g \text{ during month } t+1 \\ 
+0 & \text{otherwise} 
+\end{cases} 
+$$ 
+This formulation ensures that **predictors at time $t$ are used to forecast wildfire risk at time $t+1$**. 
+
+**Edge cases** are handled during this step. For the final month in each grid cell, the wildfire outcome of the next month is not observed, so the prediction target cannot be defined. These observations are therefore removed from the dataset. 
+```{r} 
+# the prediction target 
+panel = panel %>% 
+  arrange(lat_bin, lon_bin, ym) %>% 
+  group_by(lat_bin, lon_bin) %>% 
+  mutate( 
+    y_next = lead(fire_this_month, n = 1L) 
+  ) %>% 
+  ungroup() %>% 
+  filter(!is.na(y_next)) 
+
+table(panel$y_next) 
+``` 
+
+The result is **highly imbalanced**: most grid–months observations do not experience a notable wildfire in the next month, with 146,265 observations labeled 0 and 1,311 labeled 1. This reflects the reality that most locations in **most months do not experience large wildfires**. 
+
+This imbalance motivates the later use of **AUC** rather than accuracy as the primary evaluation metric. 
+
+### 1.6 Assign main state to each grid cell 
+Since a 1° × 1° grid cell may contain more than one state, we assign each grid cell a single state label based on the **most frequently observed state among notable fires within that cell**. 
+```{r} 
+# a function to compute the most common state within each grid cell 
+mode_state = function(x) { 
+  # counts the occurance and find the state with the highest frequency 
+  state_counts = table(x) 
+  names(state_counts)[which.max(state_counts)] 
+} 
+
+# assign each cell a state to each spatial grid cell 
+grid_state = notable_fires %>% 
+  group_by(lat_bin, lon_bin) %>% 
+  summarise(state = mode_state(STATE), .groups = "drop") %>% 
+  mutate(state = factor(state)) 
+
+# join the state information into the panel dataset 
+panel = panel %>% 
+  left_join(grid_state, by = c("lat_bin","lon_bin")) 
+
+# summarize state distribution 
+panel %>% 
+  select('state') %>% 
+  summary 
+``` 
+
+### 1.7 Seasonal predictors 
+Wildfire occurrence has strong **seasonal patterns**, with fire activity clustering in specific parts of the year. For example, fire risk typically peaks during dry summer months. 
+Instead of treating month as a categorical variable, we use **cyclical transformations**: 
+
+$$ 
+\begin{aligned} 
+\text{month_sin} &= \sin\left(\frac{2\pi \cdot month}{12}\right) \\ 
+\text{month_cos} &= \cos\left(\frac{2\pi \cdot month}{12}\right) 
+\end{aligned} 
+$$ 
+
+**to capture seasonal variations** 
+```{r} 
+panel = panel %>% 
+  mutate( 
+    month_sin = sin(2*pi*month/12), 
+    month_cos = cos(2*pi*month/12) 
+  ) 
+
+panel %>% 
+  select('month_sin', 'month_cos') %>% 
+  head 
+``` 
+
+### 1.8 Average fire size by grid-by-month 
+To capture temporal effects, we construct **predictor variables**: 
+
+- fire_lag12 - number of wildfires that occurred 12 months earlier (fire risk) 
+- fire_roll3 - number of wildfires that occurred in the past three months 
+- fire_roll12 - number of wildfires that occurred in the past 12 months 
+- size_roll3 - sum of wildfire sizes over the last three months (wildfire severity) 
+- size_roll12 - sum of wildfire sizes over the last 12 months 
+
+We select these variables as predictors since they capture multiple aspects of wildfire dynamics: 
+
+**Short-term persistence, Long-term regional risk, Severity** 
+
+```{r} 
+# average size of notable fires within each grid cell 
+grid_fire_size = notable_fires %>% 
+  group_by(lat_bin, lon_bin, ym) %>% 
+  summarise(fire_size = mean(FIRE_SIZE), .groups = "drop") 
+
+# join the fire size into the panel dataset 
+panel = panel %>% 
+  left_join(grid_fire_size, by = c("lat_bin","lon_bin", "ym")) %>% 
+  mutate(fire_size = coalesce(fire_size, 0)) 
+
+# temporal predictors that summarize wildfire activities within each spatial grid cell 
+panel = panel %>% 
+ arrange(lat_bin, lon_bin, ym) %>% 
+ group_by(lat_bin, lon_bin) %>% 
+  mutate( 
+    fire_lag12 = lag(n_fires, 12, default = 0), 
+    fire_roll3 = slide_dbl(n_fires, ~sum(.x), .before = 2, .complete = FALSE), 
+    fire_roll12 = slide_dbl(n_fires, ~sum(.x), .before = 11, .complete = FALSE), 
+    size_roll3 = slide_dbl(fire_size, ~sum(.x), .before = 2, .complete = FALSE), 
+    size_roll12 = slide_dbl(fire_size, ~sum(.x), .before = 11, .complete = FALSE) 
+    ) %>% 
+  ungroup() 
+
+panel %>% 
+  select("n_fires", "fire_lag12", "fire_roll3", "fire_roll12", 
+         "size_roll3", "size_roll12") %>% 
+  summary 
+``` 
+
+The variable `n_fires`, `fire_lag12`, `fire_roll3`, and `fire_roll12` means are also close to 0, showing that most locations have no fires in recent months. 
+For `size_roll3` and `size_roll12`, the maximum values are very large while the median values are 0. This indicates that wildfire events can **occasionally be severe, but remain relatively rare**. 
+
+### 1.9 Summary of the final modeling dataset 
+The final modeling dataset contains 147,576 observations, covering the years 1992 to 2015. 
+
+Each observation corresponds to: 
+
+- **Spatial unit**: 1° × 1° latitude–longitude  grid cell created by floor-binned grid coordinates 
+- **Temporal unit**: monthly 
+- **Outcome**: whether a notable wildfire occurs in the next month 
+
+```{r} 
+# a summary table of the final dataset used for later modeling 
+dataset_summary = tibble( 
+  n_rows = nrow(panel), 
+  year_min = min(panel$year), 
+  year_max = max(panel$year), 
+  spatial_unit = "1° x 1° lat-lon grid (floor bins)", 
+  temporal_unit = "monthly", 
+  outcome = "y_next = 1 if any notable fire occurs in grid cell next month", 
+  predictors = "lat_bin, lon_bin, state, month_cos, month_sin, n_fires, fire_lag12, fire_roll3, fire_roll12, size_roll3, size_roll12" 
+) 
+
+dataset_summary 
+``` 
+
+
+## 2. Exploratory Data Analysis 
+
+Exploratory data analysis (EDA) is used to identify the key structure of wildfire risk that guide the modeling choices. 
+
+· Identification of **spatial wildfire clusters** 
+· Visualization of **seasonal wildfire patterns** 
+· Examination of **long-term wildfire trends** 
+
+Highlights in this section: 
+
+- Wildfire risk is **spatially clustered** 
+- Wildfire occurrence follows a **strong seasonal cycle** 
+- Long-term trends are weak, suggesting notable wildfire risk is driven more by **yearly pattern and extreme events** 
+
+### Spatial pattern 
+The spatial heatmap shows the average probability of a notable wildfire occurring in the next month for each grid cell. 
+```{r, fig.width=14, fig.height=7} 
+eda_spatial = panel %>% 
+  group_by(lat_bin, lon_bin) %>% 
+  summarise(fire_rate = mean(y_next), .groups = "drop") 
+
+ggplot(eda_spatial, aes(x = lon_bin, y = lat_bin, fill = fire_rate)) + 
+  coord_quickmap(xlim = c(-125, -65), ylim = c(25, 50)) + 
+  # add borders between grid cells 
+  geom_tile(color = "white", linewidth = 0.1) + 
+  # # use a clear color scale 
+  scale_fill_viridis_c(name = "Mean next-month\nfire probability", 
+                       #display probabilities as percentages 
+                       labels = scales::percent_format(accuracy = 0.1)) + 
+  # adjust axis tick marks for longitude and latitude 
+  scale_x_continuous(breaks = seq(-125, -65, by = 10)) + 
+  scale_y_continuous(breaks = seq(25, 50, by = 5)) + 
+  labs( 
+    title = "Mean next-month notable-fire rate by grid cell", 
+    x = "Longitude", 
+    y = "Latitude" 
+  ) + 
+  theme_minimal(base_size = 21) + 
+  theme(panel.grid.minor = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) 
+``` 
+
+**Pattern shown:** 
+
+- Wildfire risk is concentrated in the **western United States**, while some areas in the eastern regions show significantly lower wildfire probability. 
+- The spatial distribution forms **clusters** rather than being randomly scattered. 
+
+This geographic clustering suggests that **location variables such as latitude and longitude** should be included as predictors. 
+
+### Spatial Pattern Over Years (Interactive Timeline) 
+The interactive heatmap with a timeline slider visualizes how wildfire probability varies spatially across different years.
+This visualization allows us to observe whether the geographic distribution of wildfire risk remains consistent or changes over time. 
+```{r, message=FALSE, warning=FALSE, fig.width=9, fig.height=5} 
+eda_spatial_year = panel %>% 
+  group_by(year, lat_bin, lon_bin) %>% 
+  summarise( 
+    fire_rate = mean(y_next), 
+    .groups = "drop" 
+  ) 
+
+library(plotly) 
+library(viridisLite) 
+
+plot_ly( 
+  data = eda_spatial_year, 
+  x = ~lon_bin, 
+  y = ~lat_bin, 
+  # timeline slider 
+  frame = ~year, 
+  type = "heatmap", 
+  z = ~fire_rate, 
+  colors = viridis(100) 
+) %>% 
+  layout( 
+    title = "Yearly Wildfire Risk by Grid Cell", 
+    xaxis = list( 
+      title = "Longitude", 
+      range = c(-125, -65) 
+    ), 
+    yaxis = list( 
+      title = "Latitude", 
+      range = c(25, 50) 
+    ), 
+    margin = list(t = 80), 
+    font = list(size = 16) 
+  ) 
+``` 
+
+**Pattern shown:** 
+
+- **High-risk areas** are generally **stable** over time, mainly remained concentrated in the western United States within the study period. 
+- **Intensity** of wildfire probability **fluctuates** between years, reflecting variation in wildfire activity driven by climate conditions and possibly extreme events. 
+
+**Purpose of this visualization:** 
+This plot complements the static spatial heatmap by showing **temporal variation** in spatial risk patterns. It helps confirm that the overall geographic hotspots remain relatively consistent. 
+
+### Temporal pattern - Seasonality 
+The monthly plot shows the average probability of a notable wildfire occurring in the next month for each month of the year. 
+```{r, fig.width=9, fig.height=5} 
+eda_month = panel %>% 
+  group_by(month) %>% 
+  summarise(mean_y_next = mean(y_next), .groups = "drop") 
+
+ggplot(eda_month, aes(x = month, y = mean_y_next)) + 
+  geom_line(linewidth = 0.8) + 
+  geom_point(size = 2.1, color = "firebrick") + 
+  scale_x_continuous(breaks = 1:12, labels = month.abb) + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) + 
+  labs( 
+    title = "Seasonality: Mean probability of a notable fire in the next month", 
+    x = "Month", 
+    y = "Mean next-month fire probability" 
+  ) + 
+  theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+``` 
+
+**Pattern shown:** 
+
+- Wildfire probability rises during **late spring and summer**, peaks during those months, and declines during winter. 
+
+**Implications:** 
+
+Since wildfire probability varies with a season pattern annually, **seasonal variables** are important predictors to include for predictive modeling. 
+
+In particular: 
+
+- **cyclical transformations** of month can be incorporated to represent seasonal effects. 
+- **GBM model** should be used to capture interactions between seasonality and spatial factors. 
+
+### Long-term Trend (Yearly Pattern) 
+The yearly plot shows the average probability of a notable wildfire occurring in the next month for each year. 
+```{r,  fig.width=9, fig.height=5} 
+eda_year = panel %>% 
+  group_by(year) %>% 
+  summarise(mean_y_next = mean(y_next),.groups = "drop") 
+
+ggplot(eda_year, aes(x = year, y = mean_y_next)) + 
+  geom_line(linewidth = 0.9) + 
+  geom_point(size = 2.1, color = "firebrick") + 
+  scale_y_continuous(labels = scales::percent_format()) + 
+  labs( 
+    title = "Trend in next-month wildfire probability over time", 
+    x = "Year", 
+    y = "Mean fire probability" 
+  ) + 
+  theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+``` 
+
+Overall, the figure **does not show a clear long-term increasing or decreasing trend** in wildfire probability during the study period. Instead, the probability fluctuates across years, with a noticeable peak and low. The peak around **2007** corresponds to a historically severe wildfire season in the western United States, when extreme drought and strong wind-driven fire events led to extreme fire activities, particularly the Southern California wildfire events driven by strong Santa Ana winds. 
+
+This pattern suggests that long-term pattern on notable wildfire risk is more influenced by **extreme events**. 
+
+**Modeling Implication:** 
+
+ - Since wildfire risk does not exhibit a consistent trend over time, including year as a predictor may impose an artificial linear effect. Therefore, **variable `year` is excluded from the predictor set**. 
+
+
+## 3. Modeling 
+**Predictors used:** 
+
+The wildfire patterns motivate the predictor set used in the models: 
+
+- Spatial clustering: `lat_bin`, `lon_bin`, `state` 
+- Seasonal patterns: `month_cos`, `month_sin` 
+- The fire history variables `n_fires`, `fire_lag12`, `fire_roll3`, `fire_roll12`, `size_roll3`, `size_roll12` are included as they represents temporal wildfire events patterns 
+
+**Models used:** 
+
+In Part 1, the dataset was constructed as a grid-by-month panel with a binary next-month outcome, and the outcome was shown to be **highly imbalanced**, with far more non-fire months than fire months. In Part 2, the exploratory analysis showed that wildfire risk **varies across space**, follows a **strong seasonal cycle**, and depends on **recent local fire history** rather than a long-term linear time trend. These findings naturally motivate a sequence of models with increasing flexibility. 
+
+Models: 
+
+- Logistic regression - baseline interpretable model 
+- Neural networks - nonlinear relationships 
+- Gradient boosting model - predictors interactions 
+
+```{r} 
+set.seed(141) 
+
+model_df = panel %>% 
+  mutate(y_next = factor(y_next, levels = c(0, 1))) %>% 
+  select(y_next, year, lat_bin, lon_bin, state, 
+         month_cos, month_sin, n_fires, 
+         fire_lag12, fire_roll3, fire_roll12, size_roll3, size_roll12) 
+
+# excluding variable `year` 
+feat_formula = y_next ~ lat_bin + lon_bin + state + month_cos + month_sin + n_fires + fire_lag12 + 
+  fire_roll3 + fire_roll12 + size_roll3 + size_roll12 
+``` 
+
+### 3.1 Baseline Model: Logistic Regression 
+The baseline model is a logistic regression defined as: 
+$$
+P(Y_{g,t+1} = 1 \mid X_{g,t}) =
+\frac{1}{1 + e^{-(\beta_0 + \sum_{i=1}^{n} \beta_i X_i)}} 
+$$ 
+where 
+
+- $Y_{g,t+1}$ indicates whether a notable wildfire occurs in grid cell $g$ during month $t+1$, 
+- $X_{g,t}$ represents the vector of predictor variables for grid cell $g$ at time $t$, 
+- $X_i$ represents predictor variables, 
+- $\beta_0$ is the intercept, 
+- $\beta_i$ are coefficients. 
+
+The logistic regression model establishes a benchmark for more complex models. 
+
+Since notable wildfire events are rare, and the dataset is highly imbalanced, we use logistic regression that **models the probability of wildfire occurrence** rather than just assigning classes, allowing the model to **rank observations by risk**. Thus, this approach make the evaluation metrics **AUC** suitable in later evaluation. 
+
+### 3.2 Neural Network Model 
+The neural network introduces **nonlinear relationships** between predictors and wildfire probability that logistic regression may miss on. 
+
+The choice of neural network model is based on previous analysis: 
+
+**1. Nonlinear response patterns** 
+
+Previous analysis suggests that wildfire risk is influenced by multiple predictors that may not follow linear pattern. Neural network are more flexible since it **does not impose a fixed equation** between predictors and the outcome. Instead, the hidden layer learns transformations of the input variables, allowing the model to approximate smooth nonlinear relationships between predictors and wildfire probability. 
+
+**2. Rare-event prediction** 
+
+Notable wildfires are relatively rare events in the dataset. In this setting, the ability of neural network model capturing subtle nonlinear patterns may help **distinguish high-risk** from low-risk grid-months and **improve the ranking** of wildfire risk. 
+
+**Model structure** 
+
+The model contains: 
+
+- input layer (predictors) 
+- hidden layer with neurons 
+- output layer predicting wildfire probability 
+
+### 3.3 Gradient Boosting Model (GBM) 
+
+The choice of Gradient Boosting Model is based on previous analysis: 
+
+**1. Nonlinear wildfire responses** 
+
+The seasonal plot and yearly probability plot in Part 2 suggest that wildfire risk may change abruptly under certain conditions rather than following a smooth trend. These patterns indicate threshold behavior, where wildfire risk increases sharply once predictors such as seasonal conditions or recent fire activity reach certain levels. Tree-based model like **GBM captures these threshold effects** by splitting observations based on predictor values, allowing the model to represent these sudden changes in wildfire probability. 
+
+**2. Predictors interactions** 
+
+Previous analysis suggests wildfire risk depends on the **combined effects** of location, seasonality, and short-term fire history. For example, recent fire events may imply different levels of risk across regions or seasons. Gradient boosting can capture these relationships by building decision trees that split on multiple variables sequentially, it emphasizes on the interaction structures between predictors. 
+
+
+## 4. Model Fitting and Validation 
+This section evaluates model performance using time-aware cross-validation. 
+
+- Avoid data leakage across time 
+1. The variable `va_year` defines the validation year, while only include observations with year ≤ train_end_year   as training data. This ensures that the model is **always trained using only past data** and evaluated on future     observations. 
+2. The fold construction enforces time-ordered cross-validation by defining **training years always precedes the    validation year**, preventing future information from leaking into the model training process. 
+  
+- Use **AUC** as the evaluation metric 
+
+Two key reasons for using AUC: 
+1. Robustness to class imbalance 
+2. AUC evaluates model performance **across all possible classification thresholds** by using the predicted probabilities produced for each observation 
+  
+**Highlights in model implementation:** 
+
+Neural Network 
+
+- **normalize numeric predictors**: Since neural networks are sensitive to variable scale, we standardize numerical variables first to prevent certain variables from dominating. 
+- **for loop** to search for best parameters `sizes`, `decays`, thus report the best neural network structure `best_auc`. 
+GBM 
+- **large number of trees**: `n.trees` = 3000 is set as an upper bound to allow the model to capture complex nonlinear structure. 
+
+```{r} 
+years_sorted = sort(unique(model_df$year)) 
+min_train_years = 3 
+
+fold_results = tibble( 
+  train_end_year = years_sorted[min_train_years:(length(years_sorted) - 2)], 
+  valid_year     = years_sorted[(min_train_years + 1):(length(years_sorted) - 1)] 
+) %>% 
+  mutate( 
+    # Logistic Regression 
+    auc_glm = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) { 
+      train = model_df %>% filter(year <= tr_end) 
+      valid = model_df %>% filter(year == va_year) 
+
+      fit = glm(feat_formula, data = train, family = binomial) 
+
+      p_hat = as.numeric(predict(fit, newdata = valid, type = "response")) 
+
+      roc_obj = roc(response = valid$y_next, predictor = p_hat, quiet = TRUE) 
+      as.numeric(auc(roc_obj)) 
+    }), 
+
+    # Neural Network 
+    auc_nn = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) { 
+      train = model_df %>% filter(year <= tr_end) 
+      valid = model_df %>% filter(year == va_year) 
+
+      num_vars = c( 
+        "lat_bin", "lon_bin", "month_cos", "month_sin", 
+        "n_fires", "fire_lag12", "fire_roll3", "fire_roll12", 
+        "size_roll3", "size_roll12" 
+      ) 
+
+      train_means = sapply(train[num_vars], mean, na.rm = TRUE) 
+      train_sds   = sapply(train[num_vars], sd, na.rm = TRUE) 
+      train_sds[train_sds == 0] = 1 
+
+      train_nn = train %>% 
+        mutate(across( 
+          all_of(num_vars), 
+          ~ (. - train_means[cur_column()]) / train_sds[cur_column()] 
+        )) 
+
+      valid_nn = valid %>% 
+        mutate(across( 
+          all_of(num_vars), 
+          ~ (. - train_means[cur_column()]) / train_sds[cur_column()] 
+        )) 
+      
+      sizes  = c(9, 14) 
+      decays = c(0.001) 
+      best_auc = -Inf 
+        
+      # determine suitable size and decay values using a foor loop 
+       for(s in sizes){ 
+         for(d in decays){ 
+           set.seed(141) 
+           fit = nnet(feat_formula, 
+                      data = train_nn, 
+                      size = s, 
+                      decay = d, 
+                      maxit = 300, 
+                      linout = FALSE, 
+                      trace = FALSE, 
+                      MaxNWts = 3000 
+                      ) 
+           p_hat = as.numeric(predict(fit, newdata = valid_nn, type = "raw")) 
+           roc_obj = roc(response = valid_nn$y_next, predictor = p_hat, quiet = TRUE) 
+           auc_val = as.numeric(auc(roc_obj)) 
+           
+           if(auc_val > best_auc){ 
+             best_auc = auc_val 
+           } 
+         } 
+         } 
+      best_auc 
+      }), 
+
+    # GBM 
+    auc_gbm = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) { 
+      train = model_df %>% filter(year <= tr_end) 
+      valid = model_df %>% filter(year == va_year) 
+
+      train_gbm = train %>% 
+        mutate(y_next = as.numeric(as.character(y_next))) 
+
+      fit = gbm( 
+        feat_formula, 
+        data = train_gbm, 
+        distribution = "bernoulli", 
+        n.trees = 3000, 
+        interaction.depth = 5, 
+        shrinkage = 0.01, 
+        bag.fraction = 0.8, 
+        verbose = FALSE 
+      ) 
+
+      p_hat = as.numeric( 
+        predict(fit, newdata = valid, n.trees = 3000, type = "response") 
+        ) 
+
+      roc_obj = roc(response = valid$y_next, predictor = p_hat, quiet = TRUE) 
+      as.numeric(auc(roc_obj)) 
+    }) 
+  ) 
+
+fold_results 
+``` 
+
+```{r,  fig.width=9, fig.height=5} 
+set.seed(141) 
+
+fold_long = fold_results %>% 
+  pivot_longer( 
+    cols = c(auc_glm, auc_nn, auc_gbm), 
+    names_to = "model", 
+    values_to = "auc" 
+  ) 
+
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) + 
+  geom_line(linewidth = 1) + 
+  geom_point(size = 2) + 
+  labs( 
+    title = "Time-aware cross-validation diagnostic: AUC by validation year", 
+    x = "Validation year", 
+    y = "AUC", 
+    color = "Model" 
+  ) + 
+  theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+``` 
+
+```{r} 
+cat('Overall, Neural Network outperforms logistic regression in AUC by ', 
+    round(mean(fold_results$auc_nn) / mean(fold_results$auc_glm) * 100, 2) - 100, "%", sep= '', "\n") 
+cat('Overall, GBM outperforms logistic regression in AUC by ', 
+    round(mean(fold_results$auc_gbm) / mean(fold_results$auc_glm) * 100, 2) - 100, "%", sep= '') 
+``` 
+
+The plot of AUC by Validation Year shows that both the **neural network and GBM models consistently outperform the baseline logistic regression model**. On average, the neural network improves AUC by 7.82%, while the gradient boosting model improves AUC by 9.84% both relative to logistic regression model. 
+
+Logistic regression model uses a **linear structure** to separate the predictors, while previous results indicate that predictors need to be explained by a non-linear structure. 
+
+Among the other two models, **GBM** achieves the higher AUC improvement. This result is consistent with the earlier modeling implication that wildfire risk may exhibit threshold behavior and interactive predictor variables. 
+The **neural network** also shows a meaningful predictive improvement over logistic regression. However, it's improvement is not as significant as would assume for neural network method. 
+
+One possible reason is that the neural network used in this study may be limited by **relatively simple structure**, where the current model contains only one hidden layer with a limited number of neurons, which may not be sufficient to fully capture complex interaction patterns. 
+In addition, **neural networks emphasizes on smooth nonlinear relationships**, whereas earlier from the plots we observed that wildfire predictors involve effects on wildfire risk that may exhibit threshold behavior, which tree-based models can detect more effectively. This difference likely explains why **GBM outperforms the other two models in these years** in the the AUC plot and the comparison results. 
+Another reason may be that GBM tend to perform well on structured tabular data such as the grid-by-month wildfire panel used in this study. 
+
+Despite these improvements, the results also indicates that the **current models did not capture wildfire risk perfectly**. Wildfire occurrence can also be influenced by other factors such as precipitation, temperature, wind speed, and human activity that was not fully represented by the current predictors. 
+
+## 5. Summary 
+This report creates a spatial-temporal framework to predict the probability of notable wildfires occurring in geographic grid cells over the next month. By aggregating wildfire incidents into a grid-by-month panel dataset, the analysis model wildfire risk across the United States. 
+
+The exploratory analysis revealed several **key patterns**. Wildfire risk is mostly concentrated in the western United States, representing the trend of regions clustering. Wildfire activity also follows a strong seasonal cycle, with the highest probabilities occurring during late spring and summer. 
+
+Three predictive models are created to capture these patterns in order to estimate wildfire risk. Models that allow more flexible relationships between predictors, particularly the **Gradient Boosting Model**, produce the best predictive performance. Tree-based models, in our case GBM, can capture nonlinear relationships and predictor variables interactions, allowing the model to represent sudden changes in wildfire risk that may occur when reaching certain threshold. The **Neural Network Model** also improves predictive accuracy compared with logistic regression, although the improvement is slightly weaker. 
+
+Despite these improvements, wildfire occurrence remains difficult to predict perfectly, **other complex environmental factors** are not included in the current analysis. As a result, the models still have limited predictive accuracy, the reported improvements in AUC reflect **relative gains in model comparison** rather than a complete explanation of wildfire dynamics. 
